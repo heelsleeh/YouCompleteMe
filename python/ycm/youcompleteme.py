@@ -31,11 +31,11 @@ import signal
 import vim
 from subprocess import PIPE
 from tempfile import NamedTemporaryFile
-from ycm import base, paths, vimsupport
+from ycm import base, paths, signature_help, vimsupport
 from ycm.buffer import ( BufferDict,
                          DIAGNOSTIC_UI_FILETYPES,
                          DIAGNOSTIC_UI_ASYNC_FILETYPES )
-from ycmd import server_utils, user_options_store, utils
+from ycmd import utils
 from ycmd.request_wrap import RequestWrap
 from ycm.omni_completer import OmniCompleter
 from ycm import syntax_parse
@@ -44,6 +44,8 @@ from ycm.client.base_request import BaseRequest, BuildRequestData
 from ycm.client.completer_available_request import SendCompleterAvailableRequest
 from ycm.client.command_request import SendCommandRequest
 from ycm.client.completion_request import CompletionRequest
+from ycm.client.signature_help_request import SignatureHelpRequest
+from ycm.client.signature_help_request import SigHelpAvailableByFileType
 from ycm.client.debug_info_request import ( SendDebugInfoRequest,
                                             FormatDebugInfoResponse )
 from ycm.client.omni_completion_request import OmniCompletionRequest
@@ -113,6 +115,9 @@ class YouCompleteMe( object ):
     self._omnicomp = None
     self._buffers = None
     self._latest_completion_request = None
+    self._latest_signature_help_request = None
+    self._signature_help_available_requests = SigHelpAvailableByFileType()
+    self._signature_help_state = signature_help.SignatureHelpState()
     self._logger = logging.getLogger( 'ycm' )
     self._client_logfile = None
     self._server_stdout = None
@@ -133,9 +138,7 @@ class YouCompleteMe( object ):
     self._server_is_ready_with_cache = False
     self._message_poll_request = None
 
-    base.LoadJsonDefaultsIntoVim()
-    user_options_store.SetAll( base.BuildServerConf() )
-    self._user_options = user_options_store.GetAll()
+    self._user_options = base.GetUserOptions()
     self._omnicomp = OmniCompleter( self._user_options )
     self._buffers = BufferDict( self._user_options )
 
@@ -254,21 +257,21 @@ class YouCompleteMe( object ):
 
     return_code = self._server_popen.poll()
     logfile = os.path.basename( self._server_stderr )
-    if return_code == server_utils.CORE_UNEXPECTED_STATUS:
-      error_message = CORE_UNEXPECTED_MESSAGE.format(
-          logfile = logfile )
-    elif return_code == server_utils.CORE_MISSING_STATUS:
+    # See https://github.com/Valloric/ycmd#exit-codes for the list of exit
+    # codes.
+    if return_code == 3:
+      error_message = CORE_UNEXPECTED_MESSAGE.format( logfile = logfile )
+    elif return_code == 4:
       error_message = CORE_MISSING_MESSAGE
-    elif return_code == server_utils.CORE_PYTHON2_STATUS:
+    elif return_code == 5:
       error_message = CORE_PYTHON2_MESSAGE
-    elif return_code == server_utils.CORE_PYTHON3_STATUS:
+    elif return_code == 6:
       error_message = CORE_PYTHON3_MESSAGE
-    elif return_code == server_utils.CORE_OUTDATED_STATUS:
+    elif return_code == 7:
       error_message = CORE_OUTDATED_MESSAGE
     else:
-      error_message = EXIT_CODE_UNEXPECTED_MESSAGE.format(
-          code = return_code,
-          logfile = logfile )
+      error_message = EXIT_CODE_UNEXPECTED_MESSAGE.format( code = return_code,
+                                                           logfile = logfile )
 
     error_message = SERVER_SHUTDOWN_MESSAGE + ' ' + error_message
     self._logger.error( error_message )
@@ -294,6 +297,7 @@ class YouCompleteMe( object ):
   def SendCompletionRequest( self, force_semantic = False ):
     request_data = BuildRequestData()
     request_data[ 'force_semantic' ] = force_semantic
+
     if not self.NativeFiletypeCompletionUsable():
       wrapped_request_data = RequestWrap( request_data )
       if self._omnicomp.ShouldUseNow( wrapped_request_data ):
@@ -319,13 +323,73 @@ class YouCompleteMe( object ):
     return response
 
 
+  def SendSignatureHelpRequest( self ):
+    filetype = vimsupport.CurrentFiletypes()[ 0 ]
+    if not self._signature_help_available_requests[ filetype ].Done():
+      return
+
+    sig_help_available = self._signature_help_available_requests[
+        filetype ].Response()
+    if sig_help_available == 'NO':
+      return
+
+    if sig_help_available == 'PENDING':
+      # Send another /signature_help_available request
+      self._signature_help_available_requests[ filetype ].Start( filetype )
+      return
+
+    if not self.NativeFiletypeCompletionUsable():
+      return
+
+    if not self._latest_completion_request:
+      return
+
+    request_data = self._latest_completion_request.request_data.copy()
+    request_data[ 'signature_help_state' ] = self._signature_help_state.state
+
+    self._AddExtraConfDataIfNeeded( request_data )
+
+    self._latest_signature_help_request = SignatureHelpRequest(
+      request_data )
+    self._latest_signature_help_request.Start()
+
+
+  def SignatureHelpRequestReady( self ):
+    return bool( self._latest_signature_help_request and
+                 self._latest_signature_help_request.Done() )
+
+
+  def GetSignatureHelpResponse( self ):
+    return self._latest_signature_help_request.Response()
+
+
+  def ClearSignatureHelp( self ):
+    self.UpdateSignatureHelp( {} )
+    if self._latest_signature_help_request:
+      self._latest_signature_help_request.Reset()
+
+
+  def UpdateSignatureHelp( self, signature_info ):
+    self._signature_help_state = signature_help.UpdateSignatureHelp(
+      self._signature_help_state,
+      signature_info )
+
+
   def SendCommandRequest( self,
                           arguments,
-                          completer,
                           modifiers,
                           has_range,
                           start_line,
                           end_line ):
+    final_arguments = []
+    for argument in arguments:
+      # The ft= option which specifies the completer when running a command is
+      # ignored because it has not been working for a long time. The option is
+      # still parsed to not break users that rely on it.
+      if argument.startswith( 'ft=' ):
+        continue
+      final_arguments.append( argument )
+
     extra_data = {
       'options': {
         'tab_size': vimsupport.GetIntValue( 'shiftwidth()' ),
@@ -335,7 +399,11 @@ class YouCompleteMe( object ):
     if has_range:
       extra_data.update( vimsupport.BuildRange( start_line, end_line ) )
     self._AddExtraConfDataIfNeeded( extra_data )
-    return SendCommandRequest( arguments, completer, modifiers, extra_data )
+
+    return SendCommandRequest( final_arguments,
+                               modifiers,
+                               self._user_options[ 'goto_buffer_command' ],
+                               extra_data )
 
 
   def GetDefinedSubcommands( self ):
@@ -383,6 +451,9 @@ class YouCompleteMe( object ):
 
 
   def UpdateWithNewDiagnosticsForFile( self, filepath, diagnostics ):
+    if not self.ShouldDisplayDiagnostics():
+      return
+
     bufnr = vimsupport.GetBufferNumberForFilename( filepath )
     if bufnr in self._buffers and vimsupport.BufferIsVisible( bufnr ):
       # Note: We only update location lists, etc. for visible buffers, because
@@ -460,6 +531,11 @@ class YouCompleteMe( object ):
 
 
   def OnBufferVisit( self ):
+    filetype = vimsupport.CurrentFiletypes()[ 0 ]
+    # The constructor of dictionary values starts the request,
+    # so the line below fires a new request only if the dictionary
+    # value is accessed for the first time.
+    self._signature_help_available_requests[ filetype ].Done()
     extra_data = {}
     self._AddUltiSnipsDataIfNeeded( extra_data )
     SendEventNotificationAsync( 'BufferVisit', extra_data = extra_data )

@@ -23,14 +23,18 @@ set cpo&vim
 let s:script_folder_path = escape( expand( '<sfile>:p:h' ), '\' )
 let s:force_semantic = 0
 let s:completion_stopped = 0
-let s:default_completion = {
-      \   'start_column': -1,
-      \   'candidates': []
-      \ }
+" These two variables are initialized in youcompleteme#Enable.
+let s:default_completion = {}
 let s:completion = s:default_completion
+let s:default_signature_help = {}
+let s:signature_help = s:default_completion
 let s:previous_allowed_buffer_number = 0
 let s:pollers = {
       \   'completion': {
+      \     'id': -1,
+      \     'wait_milliseconds': 10
+      \   },
+      \   'signature_help': {
       \     'id': -1,
       \     'wait_milliseconds': 10
       \   },
@@ -46,6 +50,11 @@ let s:pollers = {
       \     'id': -1,
       \     'wait_milliseconds': 100
       \   }
+      \ }
+let s:buftype_blacklist = {
+      \   'help': 1,
+      \   'terminal': 1,
+      \   'quickfix': 1
       \ }
 
 
@@ -85,7 +94,11 @@ endfunction
 
 
 function! s:ReceiveMessages( timer_id )
-  let poll_again = s:Pyeval( 'ycm_state.OnPeriodicTick()' )
+  let poll_again = v:false
+  if s:AllowedToCompleteInCurrentBuffer()
+    let poll_again = s:Pyeval( 'ycm_state.OnPeriodicTick()' )
+  endif
+
 
   if poll_again
     let s:pollers.receive_messages.id = timer_start(
@@ -134,11 +147,14 @@ function! youcompleteme#Enable()
     " filetype) and if so, the FileType event has triggered before and thus the
     " buffer is already parsed.
     autocmd FileType * call s:OnFileTypeSet()
-    autocmd BufEnter * call s:OnBufferEnter()
+    autocmd BufEnter,CmdwinEnter * call s:OnBufferEnter()
     autocmd BufUnload * call s:OnBufferUnload()
     autocmd InsertLeave * call s:OnInsertLeave()
     autocmd VimLeave * call s:OnVimLeave()
     autocmd CompleteDone * call s:OnCompleteDone()
+    if exists( '##CompleteChanged' )
+      autocmd CompleteChanged * call s:OnCompleteChanged()
+    endif
     autocmd BufEnter,WinEnter * call s:UpdateMatches()
   augroup END
 
@@ -147,6 +163,31 @@ function! youcompleteme#Enable()
   let s:pollers.server_ready.id = timer_start(
         \ s:pollers.server_ready.wait_milliseconds,
         \ function( 's:PollServerReady' ) )
+
+  let s:default_completion = s:Pyeval( 'vimsupport.NO_COMPLETIONS' )
+  let s:completion = s:default_completion
+
+  if exists( '*prop_type_add' ) && exists( '*prop_type_delete' )
+    call prop_type_delete( 'YCM-signature-help-current-argument' )
+    call prop_type_delete( 'YCM-signature-help-current-signature' )
+    call prop_type_delete( 'YCM-signature-help-signature' )
+
+    call prop_type_add( 'YCM-signature-help-current-argument', {
+          \   'highlight': 'PMenuSel',
+          \   'combine':   0,
+          \   'priority':  50,
+          \ } )
+    call prop_type_add( 'YCM-signature-help-current-signature', {
+          \   'highlight': 'PMenu',
+          \   'combine':   0,
+          \   'priority':  40,
+          \ } )
+    call prop_type_add( 'YCM-signature-help-signature', {
+          \   'highlight': 'PMenuSbar',
+          \   'combine':   0,
+          \   'priority':  40,
+          \ } )
+  endif
 endfunction
 
 
@@ -186,26 +227,67 @@ from __future__ import print_function
 from __future__ import division
 from __future__ import absolute_import
 
-import os
+import os.path as p
+import re
 import sys
 import traceback
 import vim
 
-# Add python sources folder to the system path.
-script_folder = vim.eval( 's:script_folder_path' )
-sys.path.insert( 0, os.path.join( script_folder, '..', 'python' ) )
-sys.path.insert( 0, os.path.join( script_folder, '..', 'third_party', 'ycmd' ) )
+root_folder = p.normpath( p.join( vim.eval( 's:script_folder_path' ), '..' ) )
+third_party_folder = p.join( root_folder, 'third_party' )
+python_stdlib_zip_regex = re.compile( 'python[23][0-9]\\.zip' )
+
+
+def IsStandardLibraryFolder( path ):
+  return ( ( p.isfile( path )
+             and python_stdlib_zip_regex.match( p.basename( path ) ) )
+           or p.isfile( p.join( path, 'os.py' ) ) )
+
+
+def IsVirtualEnvLibraryFolder( path ):
+  return p.isfile( p.join( path, 'orig-prefix.txt' ) )
+
+
+def GetStandardLibraryIndexInSysPath():
+  for index, path in enumerate( sys.path ):
+    if ( IsStandardLibraryFolder( path ) and
+         not IsVirtualEnvLibraryFolder( path ) ):
+      return index
+  raise RuntimeError( 'Could not find standard library path in Python path.' )
+
+
+# Add dependencies to Python path.
+dependencies = [ p.join( root_folder, 'python' ),
+                 p.join( third_party_folder, 'requests-futures' ),
+                 p.join( third_party_folder, 'ycmd' ),
+                 p.join( third_party_folder, 'requests_deps', 'idna' ),
+                 p.join( third_party_folder, 'requests_deps', 'chardet' ),
+                 p.join( third_party_folder,
+                         'requests_deps',
+                         'urllib3',
+                         'src' ),
+                 p.join( third_party_folder, 'requests_deps', 'certifi' ),
+                 p.join( third_party_folder, 'requests_deps', 'requests' ) ]
+
+# The concurrent.futures module is part of the standard library on Python 3.
+if sys.version_info[ 0 ] == 2:
+  dependencies.append( p.join( third_party_folder, 'pythonfutures' ) )
+
+sys.path[ 0:0 ] = dependencies
 
 # We enclose this code in a try/except block to avoid backtraces in Vim.
 try:
-  from ycmd import server_utils as su
-  su.AddNearestThirdPartyFoldersToSysPath( script_folder )
-  # We need to import ycmd's third_party folders as well since we import and
-  # use ycmd code in the client.
-  su.AddNearestThirdPartyFoldersToSysPath( su.__file__ )
+  # The python-future module must be inserted after the standard library path.
+  sys.path.insert( GetStandardLibraryIndexInSysPath() + 1,
+                   p.join( third_party_folder, 'python-future', 'src' ) )
 
   # Import the modules used in this file.
   from ycm import base, vimsupport, youcompleteme
+
+  if 'ycm_state' in globals():
+    # If re-initializing, pretend that we shut down
+    ycm_state.OnVimLeave()
+    del ycm_state
 
   ycm_state = youcompleteme.YouCompleteMe()
 except Exception as error:
@@ -272,7 +354,7 @@ function! s:SetUpKeyMappings()
     endif
 
     silent! exe 'inoremap <unique> <silent> ' . invoke_key .
-          \ ' <C-R>=<SID>InvokeSemanticCompletion()<CR>'
+          \ ' <C-R>=<SID>RequestSemanticCompletion()<CR>'
   endif
 
   if !empty( g:ycm_key_detailed_diagnostics )
@@ -391,21 +473,23 @@ endfunction
 
 
 function! s:AllowedToCompleteInBuffer( buffer )
-  let buffer_filetype = getbufvar( a:buffer, '&filetype' )
+  let buftype = getbufvar( a:buffer, '&buftype' )
 
-  if empty( buffer_filetype ) ||
-        \ getbufvar( a:buffer, '&buftype' ) ==# 'nofile' ||
-        \ buffer_filetype ==# 'qf'
+  if has_key( s:buftype_blacklist, buftype )
     return 0
   endif
 
-  if s:DisableOnLargeFile( a:buffer )
+  let filetype = getbufvar( a:buffer, '&filetype' )
+
+  if empty( filetype ) || s:DisableOnLargeFile( a:buffer )
     return 0
   endif
 
-  let whitelist_allows = has_key( g:ycm_filetype_whitelist, '*' ) ||
-        \ has_key( g:ycm_filetype_whitelist, buffer_filetype )
-  let blacklist_allows = !has_key( g:ycm_filetype_blacklist, buffer_filetype )
+  let whitelist_allows = type( g:ycm_filetype_whitelist ) != type( {} ) ||
+        \ has_key( g:ycm_filetype_whitelist, '*' ) ||
+        \ has_key( g:ycm_filetype_whitelist, filetype )
+  let blacklist_allows = type( g:ycm_filetype_blacklist ) != type( {} ) ||
+        \ !has_key( g:ycm_filetype_blacklist, filetype )
 
   let allowed = whitelist_allows && blacklist_allows
   if allowed
@@ -470,16 +554,42 @@ endfunction
 
 
 function! s:OnVimLeave()
+  " Workaround a NeoVim issue - not shutting down timers correctly
+  " https://github.com/neovim/neovim/issues/6840
+  for poller in values( s:pollers )
+    call timer_stop( poller.id )
+  endfor
   exec s:python_command "ycm_state.OnVimLeave()"
 endfunction
 
 
 function! s:OnCompleteDone()
+  if !s:AllowedToCompleteInCurrentBuffer()
+    return
+  endif
+
   exec s:python_command "ycm_state.OnCompleteDone()"
+  call s:UpdateSignatureHelp()
+endfunction
+
+
+function! s:OnCompleteChanged()
+  if !s:AllowedToCompleteInCurrentBuffer()
+    return
+  endif
+
+  call s:UpdateSignatureHelp()
 endfunction
 
 
 function! s:OnFileTypeSet()
+  " The contents of the command-line window are empty when the filetype is set
+  " for the first time. Users should never change its filetype so we only rely
+  " on the CmdwinEnter event for that window.
+  if !empty( getcmdwintype() )
+    return
+  endif
+
   if !s:AllowedToCompleteInCurrentBuffer()
     return
   endif
@@ -553,6 +663,9 @@ function! s:OnFileReadyToParse( ... )
   " We only want to send a new FileReadyToParse event notification if the buffer
   " has changed since the last time we sent one, or if forced.
   if force_parsing || s:Pyeval( "ycm_state.NeedsReparse()" )
+    " We switched buffers or somethuing, so claer.
+    " FIXME: sig hekp should be buffer local?
+    call s:ClearSignatureHelp()
     exec s:python_command "ycm_state.OnFileReadyToParse()"
 
     call timer_stop( s:pollers.file_parse_response.id )
@@ -604,6 +717,9 @@ function! s:OnInsertChar()
 
   call timer_stop( s:pollers.completion.id )
   call s:CloseCompletionMenu()
+
+  " TODO: Do we really need this here?
+  call timer_stop( s:pollers.signature_help.id )
 endfunction
 
 
@@ -613,6 +729,9 @@ function! s:OnDeleteChar( key )
   endif
 
   call timer_stop( s:pollers.completion.id )
+  "
+  " TODO: Do we really need this here?
+  call timer_stop( s:pollers.signature_help.id )
   if pumvisible()
     return "\<C-y>" . a:key
   endif
@@ -622,6 +741,9 @@ endfunction
 
 function! s:StopCompletion( key )
   call timer_stop( s:pollers.completion.id )
+
+  call s:ClearSignatureHelp()
+
   if pumvisible()
     let s:completion_stopped = 1
     return "\<C-y>"
@@ -674,7 +796,10 @@ function! s:OnTextChangedInsertMode()
         \ !s:OnBlankLine()
     " Immediately call previous completion to avoid flickers.
     call s:Complete()
-    call s:InvokeCompletion()
+    call s:RequestCompletion()
+
+    call s:UpdateSignatureHelp()
+    call s:RequestSignatureHelp()
   endif
 
   exec s:python_command "ycm_state.OnCursorMoved()"
@@ -700,6 +825,8 @@ function! s:OnInsertLeave()
         \ g:ycm_autoclose_preview_window_after_insertion
     call s:ClosePreviewWindowIfNeeded()
   endif
+
+  call s:ClearSignatureHelp()
 endfunction
 
 
@@ -767,7 +894,7 @@ function! s:OnBlankLine()
 endfunction
 
 
-function! s:InvokeCompletion()
+function! s:RequestCompletion()
   exec s:python_command "ycm_state.SendCompletionRequest(" .
         \ "vimsupport.GetBoolValue( 's:force_semantic' ) )"
 
@@ -775,7 +902,7 @@ function! s:InvokeCompletion()
 endfunction
 
 
-function! s:InvokeSemanticCompletion()
+function! s:RequestSemanticCompletion()
   if &completefunc == "youcompleteme#CompleteFunc"
     let s:force_semantic = 1
     exec s:python_command "ycm_state.SendCompletionRequest( True )"
@@ -798,12 +925,40 @@ function! s:PollCompletion( ... )
     return
   endif
 
-  let response = s:Pyeval( 'ycm_state.GetCompletionResponse()' )
-  let s:completion = {
-        \   'start_column': response.completion_start_column,
-        \   'candidates': response.completions
-        \ }
+  let s:completion = s:Pyeval( 'ycm_state.GetCompletionResponse()' )
   call s:Complete()
+endfunction
+
+
+function! s:ShouldUseSignatureHelp()
+  return s:Pyeval( 'vimsupport.VimSupportsPopupWindows()' )
+endfunction
+
+
+function! s:RequestSignatureHelp()
+  if !s:ShouldUseSignatureHelp()
+    return
+  endif
+
+  exec s:python_command "ycm_state.SendSignatureHelpRequest()"
+  call s:PollSignatureHelp()
+endfunction
+
+
+function! s:PollSignatureHelp( ... )
+  if !s:ShouldUseSignatureHelp()
+    return
+  endif
+
+  if !s:Pyeval( 'ycm_state.SignatureHelpRequestReady()' )
+    let s:pollers.signature_help.id = timer_start(
+          \ s:pollers.signature_help.wait_milliseconds,
+          \ function( 's:PollSignatureHelp' ) )
+    return
+  endif
+
+  let s:signature_help = s:Pyeval( 'ycm_state.GetSignatureHelpResponse()' )
+  call s:UpdateSignatureHelp()
 endfunction
 
 
@@ -811,26 +966,66 @@ function! s:Complete()
   " Do not call user's completion function if the start column is after the
   " current column or if there are no candidates. Close the completion menu
   " instead. This avoids keeping the user in completion mode.
-  if s:completion.start_column > col( '.' ) || empty( s:completion.candidates )
+  if s:completion.completion_start_column > s:completion.column ||
+        \ empty( s:completion.completions )
     call s:CloseCompletionMenu()
   else
     " <c-x><c-u> invokes the user's completion function (which we have set to
     " youcompleteme#CompleteFunc), and <c-p> tells Vim to select the previous
-    " completion candidate. This is necessary because by default, Vim selects the
-    " first candidate when completion is invoked, and selecting a candidate
-    " automatically replaces the current text with it. Calling <c-p> forces Vim to
-    " deselect the first candidate and in turn preserve the user's current text
-    " until he explicitly chooses to replace it with a completion.
+    " completion candidate. This is necessary because by default, Vim selects
+    " the first candidate when completion is invoked, and selecting a candidate
+    " automatically replaces the current text with it. Calling <c-p> forces Vim
+    " to deselect the first candidate and in turn preserve the user's current
+    " text until he explicitly chooses to replace it with a completion.
     call s:SendKeys( "\<C-X>\<C-U>\<C-P>" )
   endif
+  " Displaying or hiding the PUM might mean we need to hide the sig help
+  call s:UpdateSignatureHelp()
 endfunction
 
 
 function! youcompleteme#CompleteFunc( findstart, base )
   if a:findstart
-    return s:completion.start_column - 1
+    " When auto-wrapping is enabled, Vim wraps the current line after the
+    " completion request is sent but before calling this function. The starting
+    " column returned by the server is invalid in that case and must be
+    " recomputed.
+    if s:completion.line != line( '.' )
+      " Given
+      "   scb: column where the completion starts before auto-wrapping
+      "   cb: cursor column before auto-wrapping
+      "   sca: column where the completion starts after auto-wrapping
+      "   ca: cursor column after auto-wrapping
+      " we have
+      "   ca - sca = cb - scb
+      "   sca = scb + ca - cb
+      let s:completion.completion_start_column +=
+            \ col( '.' ) - s:completion.column
+    endif
+    return s:completion.completion_start_column - 1
   endif
-  return s:completion.candidates
+  return s:completion.completions
+endfunction
+
+
+function! s:UpdateSignatureHelp()
+  if !s:ShouldUseSignatureHelp()
+    return
+  endif
+
+  call s:Pyeval(
+        \ 'ycm_state.UpdateSignatureHelp( vim.eval( "s:signature_help" ) )' )
+endfunction
+
+
+function! s:ClearSignatureHelp()
+  if !s:ShouldUseSignatureHelp()
+    return
+  endif
+
+  call timer_stop( s:pollers.signature_help.id )
+  let s:signature_help = s:default_signature_help
+  call s:Pyeval( 'ycm_state.ClearSignatureHelp()' )
 endfunction
 
 
@@ -873,6 +1068,8 @@ function! s:RestartServer()
   call timer_stop( s:pollers.receive_messages.id )
   let s:pollers.receive_messages.id = -1
 
+  call s:ClearSignatureHelp()
+
   call timer_stop( s:pollers.server_ready.id )
   let s:pollers.server_ready.id = timer_start(
         \ s:pollers.server_ready.wait_milliseconds,
@@ -900,26 +1097,8 @@ endfunction
 
 
 function! s:CompleterCommand( mods, count, line1, line2, ... )
-  " CompleterCommand will call the OnUserCommand function of a completer. If
-  " the first arguments is of the form "ft=..." it can be used to specify the
-  " completer to use (for example "ft=cpp"). Else the native filetype completer
-  " of the current buffer is used. If no native filetype completer is found and
-  " no completer was specified this throws an error. You can use "ft=ycm:ident"
-  " to select the identifier completer. The remaining arguments will be passed
-  " to the completer.
-  let arguments = copy(a:000)
-  let completer = ''
-
-  if a:0 > 0 && strpart(a:1, 0, 3) == 'ft='
-    if a:1 == 'ft=ycm:ident'
-      let completer = 'identifier'
-    endif
-    let arguments = arguments[1:]
-  endif
-
   exec s:python_command "ycm_state.SendCommandRequest(" .
-        \ "vim.eval( 'l:arguments' )," .
-        \ "vim.eval( 'l:completer' )," .
+        \ "vim.eval( 'a:000' )," .
         \ "vim.eval( 'a:mods' )," .
         \ "vimsupport.GetBoolValue( 'a:count != -1' )," .
         \ "vimsupport.GetIntValue( 'a:line1' )," .
